@@ -2,6 +2,8 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.RegularExpressions;
+using KumoLogReader.Lib;
+using OfficeOpenXml;
 
 namespace KumoLogReader;
 
@@ -13,30 +15,53 @@ internal class Program
         var maxThreads = 100;
         var path = "E:\\Sync-TCPOS\\Projects\\Denner - 2023.11.19\\Performaces\\202412162.log";
 
-        var r = new Regex("(?<guid>[a-z0-9]{8}(-[a-z0-9]{4}){3}-[a-z0-9]{12})");
-        var aaaa = File.ReadLines(path).Select(l => r.Match(l)).Where(m => m.Success).Select(m => m.Value).Distinct().ToArray();
-        Debug.WriteLine("Guids: " + aaaa.Length);
+        Console.WriteLine($"Start reading log: {path}");
+        Console.WriteLine("Determining guids number");
+        var guidRegex = new Regex("(?<guid>[a-z0-9]{8}(-[a-z0-9]{4}){3}-[a-z0-9]{12})");
+        var guids = File.ReadLines(path).Select(l => guidRegex.Match(l)).Where(m => m.Success).Select(m => m.Value).Distinct().ToArray();
+        Console.WriteLine($"Guids found: {guids.Length}");
 
+        Console.WriteLine("Parsing log");
+        Console.WriteLine("");
         var data = await ParseLog(path, maxThreads, maxRows);
 
-        Debug.WriteLine("Guids: " + data.Length);
+        var fileName = $"{path}.xlsx";
+        Console.WriteLine($"Writing excel file: {fileName}");
 
-        foreach (var data1 in data)
+        ExcelPackage.LicenseContext = LicenseContext.NonCommercial;
+        using var excelPackage = new ExcelPackage(fileName);
+
+        foreach (var workbookWorksheet in excelPackage.Workbook.Worksheets.ToArray())
         {
-            Debug.WriteLine($"Request Id: {data1.Id}");
+            excelPackage.Workbook.Worksheets.Delete(workbookWorksheet.Name);
         }
-
-        Debug.WriteLine("********** File parsed");
+        var worksheet = excelPackage.Workbook.Worksheets.Add("Raw-Data");
+        worksheet.Cells.LoadFromCollection(data.Where(i => i.RequestData.Time > TimeSpan.MinValue && i.ResponseData.Time > TimeSpan.MinValue).Select(i => new
+        {
+            Guid = i.Id,
+            StartTime = i.RequestData.Time,
+            EndTime = i.ResponseData.Time,
+            (i.ResponseData.Time - i.RequestData.Time).TotalSeconds,
+            i.RequestData.Method,
+            i.RequestData.Url,
+            //i.RequestData.RequestBody,
+            i.ResponseData.StatusCode,
+            //i.ResponseData.ResponseBody
+        }),true);
+        await excelPackage.SaveAsync();
+        Console.WriteLine("Done");
     }
 
-    private static async Task<Data[]> ParseLog(string path, int maxThreads, int maxRows)
+    private static async Task<LogData[]> ParseLog(string path, int maxThreads, int maxRows)
     {
+        using var consoleLogMutex = new Mutex();
         using var semaphoreSlim = new SemaphoreSlim(maxThreads, maxThreads);
-        var lines = new List<string>();
         using var mutexes = new DisposableList<Mutex>();
         using var lockValue = new LockValue<int>(0);
-        var l = new FileInfo(path).Length;
-        var concurrentDictionary = new ConcurrentDictionary<string, Data>();
+
+        var lines = new List<string>();
+        var fileSize = new FileInfo(path).Length;
+        var concurrentDictionary = new ConcurrentDictionary<string, LogData>();
 
         await foreach (var line in File.ReadLinesAsync(path))
         {
@@ -46,7 +71,7 @@ internal class Program
                 var mutex = new Mutex();
                 mutexes.Add(mutex);
 
-                thread.Start(new ThreadData(lines.ToArray(), mutex, semaphoreSlim, concurrentDictionary, lockValue, l));
+                thread.Start(new ThreadParam(lines.ToArray(), fileSize, concurrentDictionary, mutex, semaphoreSlim, lockValue, consoleLogMutex));
 
                 lines.Clear();
             }
@@ -66,100 +91,107 @@ internal class Program
 
     private static void ThreadAction(object? o)
     {
-        var threadData = o as ThreadData ?? throw new ArgumentNullException();
+        var threadParams = o as ThreadParam ?? throw new ArgumentNullException();
 
         var requestRegex = new Regex(@"(?i)^(?<time>\d{2}:\d{2}:\d{2}\.\d{3})\s*\[inf\]\s*request:\s*requestid:\s*(?<guid>[a-z0-9]{8}(-[a-z0-9]{4}){3}-[a-z0-9]{12})\s*method:\s*\[(?<method>\w+)\]\s*URI:\s*(?<url>.+?)\s*body:\s*({(?<body>.*?)}){0,1}$");
 
         var responseRegex = new Regex(@"(?i)^(?<time>\d{2}:\d{2}:\d{2}\.\d{3})\s*\[inf\]\s*response:\s*requestid:\s*(?<guid>[a-z0-9]{8}(-[a-z0-9]{4}){3}-[a-z0-9]{12})\s*statuscode:\s*(?<statusCode>\d{3})\s*response:\s*{{0,1}$");
 
-        threadData.Mutex.WaitOne();
-        threadData.SemaphoreSlim.Wait();
+        using var ml = threadParams.ThreadMutex.Lock();
+        using var sl = threadParams.SemaphoreSlim.Lock();
 
-        try
+        var tmpData = default(LogData);
+
+        var prevPercentage = 100.0 * threadParams.BytesRead.Value / threadParams.TotalBytes;
+
+        foreach (var line in threadParams.Lines)
         {
-            var tmpData = default(Data);
+            threadParams.BytesRead.Value += line.Length;
 
-            var init = 100.0 * threadData.ReadData.Value / threadData.FileSize;
+            var currentPercentage = 100.0 * threadParams.BytesRead.Value / threadParams.TotalBytes;
 
-            foreach (var line in threadData.Lines)
+            if (currentPercentage > prevPercentage + 1)
             {
-                threadData.ReadData.Value += line.Length;
-                var cur = 100.0 * threadData.ReadData.Value / threadData.FileSize;
+                using var _ = threadParams.ConsoleLogMutex.Lock();
 
-                if (cur > init + 1)
+                var cursorTop = Console.CursorTop;
+                var cursorLeft = Console.CursorLeft;
+
+                Console.Write($"[{ProgressBar(currentPercentage, 20)}] {currentPercentage:0.00}%");
+                prevPercentage = currentPercentage;
+
+                Console.CursorTop = cursorTop;
+                Console.CursorLeft = cursorLeft;
+            }
+
+            if (tmpData != null)
+            {
+                tmpData = tmpData with
                 {
-                    Debug.WriteLine($"{100.0 * threadData.ReadData.Value / threadData.FileSize:0.00}% ThreadId: {threadData.SemaphoreSlim.CurrentCount}");
-                    init = cur;
-                }
-
-                if (tmpData != null)
-                {
-                    tmpData = tmpData with
+                    ResponseData = tmpData.ResponseData with
                     {
-                        ResponseData = tmpData.ResponseData with
-                        {
-                            ResponseBody = tmpData.ResponseData.ResponseBody + line
-                        }
-                    };
-
-                    if (line == "}")
-                    {
-                        tmpData = UseResponse(threadData.Dictionary, tmpData);
-
-                        //Debug.WriteLine(JsonSerializer.Serialize(tmpData, new JsonSerializerOptions
-                        //{
-                        //    WriteIndented = true
-                        //}));
-
-                        tmpData = null;
+                        ResponseBody = tmpData.ResponseData.ResponseBody + line
                     }
+                };
 
-                    continue;
+                if (line == "}")
+                {
+                    tmpData = UseResponse(threadParams.Dictionary, tmpData);
+
+                    //Debug.WriteLine(JsonSerializer.Serialize(tmpData, new JsonSerializerOptions
+                    //{
+                    //    WriteIndented = true
+                    //}));
+
+                    tmpData = null;
                 }
 
-                var match = requestRegex.Match(line);
+                continue;
+            }
 
-                if (match.Success)
+            var match = requestRegex.Match(line);
+
+            if (match.Success)
+            {
+                var data = new LogData(match.Groups["guid"].Value, new RequestData(TimeSpan.Parse(match.Groups["time"].Value, CultureInfo.InvariantCulture), match.Groups["url"].Value, match.Groups["method"].Value, "{" + match.Groups["body"].Value + "}"), new ResponseData(TimeSpan.MinValue, -1, ""));
+
+                UseRequest(threadParams.Dictionary, data);
+
+                continue;
+            }
+
+            match = responseRegex.Match(line);
+
+            if (match.Success)
+            {
+                tmpData = new LogData(match.Groups["guid"].Value, new RequestData(TimeSpan.MinValue, "", "", ""), new ResponseData(TimeSpan.Parse(match.Groups["time"].Value, CultureInfo.InvariantCulture), int.Parse(match.Groups["statusCode"].Value), line.EndsWith("{") ? "{" : "{}"));
+
+                if (!line.EndsWith("{"))
                 {
-                    var data = new Data(match.Groups["guid"].Value, new RequestData(TimeSpan.Parse(match.Groups["time"].Value, CultureInfo.InvariantCulture), match.Groups["url"].Value, match.Groups["method"].Value, "{" + match.Groups["body"].Value + "}"), new ResponseData(TimeSpan.MinValue, -1, ""));
+                    tmpData = UseResponse(threadParams.Dictionary, tmpData);
 
-                    UseRequest(threadData.Dictionary, data);
+                    //Debug.WriteLine(JsonSerializer.Serialize(tmpData, new JsonSerializerOptions
+                    //{
+                    //    WriteIndented = true
+                    //}));
 
-                    continue;
-                }
-
-                match = responseRegex.Match(line);
-
-                if (match.Success)
-                {
-                    tmpData = new Data(match.Groups["guid"].Value, new RequestData(TimeSpan.MinValue, "", "", ""), new ResponseData(TimeSpan.Parse(match.Groups["time"].Value, CultureInfo.InvariantCulture), int.Parse(match.Groups["statusCode"].Value), line.EndsWith("{") ? "{" : "{}"));
-
-                    if (!line.EndsWith("{"))
-                    {
-                        tmpData = UseResponse(threadData.Dictionary, tmpData);
-
-                        //Debug.WriteLine(JsonSerializer.Serialize(tmpData, new JsonSerializerOptions
-                        //{
-                        //    WriteIndented = true
-                        //}));
-
-                        tmpData = null;
-                    }
+                    tmpData = null;
                 }
             }
-        }
-        finally
-        {
-            threadData.SemaphoreSlim.Release();
-            threadData.Mutex.ReleaseMutex();
         }
 
         Debug.WriteLine("********** End thread");
     }
 
-    private static Data UseResponse(ConcurrentDictionary<string, Data> threadDataDictionary, Data data)
+    private static string ProgressBar(double currentPercentage, int barLength)
     {
-        var tmpData = data;
+        var completed = barLength * currentPercentage / 100;
+        return string.Join("", Enumerable.Range(0, barLength).Select(i => i < completed ? "*" : " "));
+    }
+
+    private static LogData UseResponse(ConcurrentDictionary<string, LogData> threadDataDictionary, LogData logData)
+    {
+        var tmpData = logData;
 
         if (threadDataDictionary.TryGetValue(tmpData.Id, out var value1))
         {
@@ -173,9 +205,9 @@ internal class Program
         return tmpData;
     }
 
-    private static Data UseRequest(ConcurrentDictionary<string, Data> threadDataDictionary, Data data)
+    private static LogData UseRequest(ConcurrentDictionary<string, LogData> threadDataDictionary, LogData logData)
     {
-        var tmpData = data;
+        var tmpData = logData;
 
         if (threadDataDictionary.TryGetValue(tmpData.Id, out var value1))
         {

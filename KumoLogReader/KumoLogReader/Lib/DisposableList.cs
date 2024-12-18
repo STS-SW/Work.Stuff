@@ -1,4 +1,4 @@
-﻿namespace KumoLogReader;
+﻿namespace KumoLogReader.Lib;
 
 internal class DisposableList<T> : List<T>, IDisposable
     where T : IDisposable

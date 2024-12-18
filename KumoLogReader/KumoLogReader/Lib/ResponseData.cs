@@ -1,3 +1,3 @@
-﻿namespace KumoLogReader;
+﻿namespace KumoLogReader.Lib;
 
-internal record ResponseData(TimeSpan EndTime, int StatusCode, string ResponseBody);
+internal record ResponseData(TimeSpan Time, int StatusCode, string ResponseBody);

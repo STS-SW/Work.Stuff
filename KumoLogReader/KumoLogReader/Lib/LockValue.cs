@@ -1,4 +1,4 @@
-﻿namespace KumoLogReader;
+﻿namespace KumoLogReader.Lib;
 
 internal class LockValue<T>(T value) : IDisposable
 {
@@ -10,40 +10,24 @@ internal class LockValue<T>(T value) : IDisposable
     {
         get
         {
-            if (_isClass)
-            {
-                _mutex.WaitOne();
-            }
-
-            try
+            if (!_isClass)
             {
                 return _value;
             }
-            finally
-            {
-                if (_isClass)
-                {
-                    _mutex.ReleaseMutex();
-                }
-            }
+
+            using var _ = _mutex.Lock();
+            return _value;
         }
         set
         {
             if (_isClass)
             {
-                _mutex.WaitOne();
-            }
-
-            try
-            {
+                using var _ = _mutex.Lock();
                 _value = value;
             }
-            finally
+            else
             {
-                if (_isClass)
-                {
-                    _mutex.ReleaseMutex();
-                }
+                _value = value;
             }
         }
     }

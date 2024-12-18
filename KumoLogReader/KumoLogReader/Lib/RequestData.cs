@@ -1,3 +1,3 @@
-﻿namespace KumoLogReader;
+﻿namespace KumoLogReader.Lib;
 
-internal record RequestData(TimeSpan StartTime, string Url, string Method, string RequestBody);
+internal record RequestData(TimeSpan Time, string Url, string Method, string RequestBody);
